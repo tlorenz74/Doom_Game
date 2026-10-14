@@ -3,6 +3,9 @@
 Hellbound is a small, asset-free, Doom-inspired first-person shooter made with
 Python 3.13 and pygame. Fight through two levels, clear the demons, and find
 the portal to escape.
+Gunfire and demon-hit sound effects are synthesized by the game, and successful
+hits trigger a brief pixel-style blood splatter. No sound or image files are
+required.
 
 ## Quick start on Windows (no Python required)
 

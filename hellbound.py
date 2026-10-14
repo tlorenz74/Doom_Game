@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+from array import array
 import math
+import random
 import sys
 
 import pygame
@@ -175,9 +177,32 @@ def make_exit_sprite() -> pygame.Surface:
     return sprite
 
 
+def make_sound_effect(kind: str, sample_rate: int, channels: int) -> pygame.mixer.Sound:
+    duration = 0.24 if kind == "gun" else 0.2
+    sample_count = int(sample_rate * duration)
+    samples = array("h")
+    noise = random.Random(1 if kind == "gun" else 2)
+    for index in range(sample_count):
+        time = index / sample_rate
+        if kind == "gun":
+            envelope = math.exp(-time * 23)
+            pitch = 105 - 250 * time
+            tone = math.sin(2 * math.pi * pitch * time)
+            value = (noise.uniform(-1, 1) * 0.78 + tone * 0.36) * envelope
+        else:
+            envelope = math.exp(-time * 29)
+            thud = math.sin(2 * math.pi * (92 - 170 * time) * time) * 0.65
+            splat = noise.uniform(-1, 1) * math.exp(-time * 34) * 0.55
+            value = (thud + splat) * envelope
+        sample = max(-32768, min(32767, int(value * 26000)))
+        samples.extend([sample] * channels)
+    return pygame.mixer.Sound(buffer=samples)
+
+
 class Hellbound:
     def __init__(self) -> None:
         pygame.init()
+        self.gun_sound, self.hit_sound = self.initialize_sounds()
         pygame.display.set_caption("HELLBOUND")
         self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
         self.clock = pygame.time.Clock()
@@ -193,7 +218,26 @@ class Hellbound:
         self.shot_cooldown = 0.0
         self.muzzle_timer = 0.0
         self.damage_flash = 0.0
+        self.blood_particles = []
         self.reset_game()
+
+    def initialize_sounds(self) -> tuple[pygame.mixer.Sound | None, pygame.mixer.Sound | None]:
+        if pygame.mixer.get_init() is None:
+            try:
+                pygame.mixer.init(frequency=22050, size=-16, channels=1, buffer=512)
+            except pygame.error as error:
+                print(f"Audio unavailable; continuing without sound: {error}", file=sys.stderr)
+                return None, None
+        audio_format = pygame.mixer.get_init()
+        if audio_format is None:
+            print("Audio unavailable; continuing without sound.", file=sys.stderr)
+            return None, None
+        sample_rate = audio_format[0]
+        channels = audio_format[2]
+        return (
+            make_sound_effect("gun", sample_rate, channels),
+            make_sound_effect("hit", sample_rate, channels),
+        )
 
     def reset_game(self) -> None:
         self.level_index = 0
@@ -249,6 +293,8 @@ class Hellbound:
             return
         self.shot_cooldown = 0.32
         self.muzzle_timer = 0.09
+        if self.gun_sound:
+            self.gun_sound.play()
         best_enemy = None
         best_distance = 7.0
         for enemy in self.enemies:
@@ -263,9 +309,37 @@ class Hellbound:
                 best_enemy = enemy
                 best_distance = distance
         if best_enemy:
+            if self.hit_sound:
+                self.hit_sound.play()
+            self.spawn_blood_splatter(best_enemy["x"], best_enemy["y"])
             best_enemy["hp"] -= 1
             if best_enemy["hp"] <= 0:
                 self.enemies.remove(best_enemy)
+
+    def spawn_blood_splatter(self, world_x: float, world_y: float) -> None:
+        distance = max(0.2, math.hypot(world_x - self.player_x, world_y - self.player_y))
+        relative_angle = normalize_angle(math.atan2(world_y - self.player_y, world_x - self.player_x) - self.angle)
+        screen_x = SCREEN_WIDTH / 2 + math.tan(relative_angle) * (
+            SCREEN_WIDTH / 2 / math.tan(FOV / 2)
+        )
+        sprite_height = min(SCREEN_HEIGHT * 1.4, SCREEN_HEIGHT / distance * 0.82)
+        screen_y = SCREEN_HEIGHT / 2 + sprite_height * 0.06
+        scale = max(0.45, min(1.5, 7.0 / distance))
+        colors = ((186, 31, 39), (137, 20, 30), (222, 48, 47))
+        for _ in range(13):
+            angle = random.uniform(0, math.tau)
+            speed = random.uniform(34, 105) * scale
+            lifetime = random.uniform(0.24, 0.52)
+            self.blood_particles.append({
+                "x": screen_x,
+                "y": screen_y,
+                "vx": math.cos(angle) * speed,
+                "vy": math.sin(angle) * speed - 14 * scale,
+                "size": random.uniform(2.0, 5.0) * scale,
+                "color": random.choice(colors),
+                "life": lifetime,
+                "duration": lifetime,
+            })
 
     def move_player(self, delta_time: float) -> None:
         keys = pygame.key.get_pressed()
@@ -333,6 +407,7 @@ class Hellbound:
         self.muzzle_timer = max(0.0, self.muzzle_timer - delta_time)
         self.damage_flash = max(0.0, self.damage_flash - delta_time)
         self.message_timer = max(0.0, self.message_timer - delta_time)
+        self.update_blood_particles(delta_time)
         if self.state != "playing":
             return
         self.move_player(delta_time)
@@ -340,6 +415,16 @@ class Hellbound:
         if self.health <= 0:
             self.state = "dead"
             self.set_playing(False)
+
+    def update_blood_particles(self, delta_time: float) -> None:
+        for particle in self.blood_particles:
+            particle["life"] -= delta_time
+            particle["x"] += particle["vx"] * delta_time
+            particle["y"] += particle["vy"] * delta_time
+            particle["vy"] += 180 * delta_time
+        self.blood_particles = [
+            particle for particle in self.blood_particles if particle["life"] > 0
+        ]
 
     def draw_world(self) -> None:
         horizon = SCREEN_HEIGHT // 2
@@ -370,6 +455,7 @@ class Hellbound:
             if wall_height > 18 and int(texture * 12) % 6 == 0:
                 pygame.draw.line(self.screen, (22, 20, 24), (x, top), (x, bottom), 1)
         self.draw_billboards(z_buffer)
+        self.draw_blood_splatter()
         self.draw_weapon()
         self.draw_hud()
         if self.minimap:
@@ -412,6 +498,15 @@ class Hellbound:
         )
         for x, y, sprite in objects:
             self.draw_billboard(sprite, x, y, z_buffer)
+
+    def draw_blood_splatter(self) -> None:
+        for particle in self.blood_particles:
+            fade = particle["life"] / particle["duration"]
+            radius = max(1, int(particle["size"] * fade))
+            color = tuple(int(channel * (0.65 + 0.35 * fade)) for channel in particle["color"])
+            pygame.draw.circle(
+                self.screen, color, (int(particle["x"]), int(particle["y"])), radius
+            )
 
     def draw_weapon(self) -> None:
         center = SCREEN_WIDTH // 2
